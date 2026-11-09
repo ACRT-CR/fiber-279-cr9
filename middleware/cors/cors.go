@@ -1,6 +1,8 @@
 package cors
 
 import (
+	"log"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -14,7 +16,7 @@ type Config struct {
 	// Optional. Default: nil
 	Next func(c *fiber.Ctx) bool
 
-	// AllowOrigin defines a list of origins that may access the resource.
+	// AllowOrigin defines a comma separated list of origins that may access the resource.
 	//
 	// Optional. Default value "*"
 	AllowOrigins string
@@ -34,7 +36,8 @@ type Config struct {
 	// AllowCredentials indicates whether or not the response to the request
 	// can be exposed when the credentials flag is true. When used as part of
 	// a response to a preflight request, this indicates whether or not the
-	// actual request can be made using credentials.
+	// actual request can be made using credentials. Note: If true, AllowOrigins
+	// cannot be set to a wildcard ("*") to prevent security vulnerabilities.
 	//
 	// Optional. Default value false.
 	AllowCredentials bool
@@ -70,6 +73,35 @@ var ConfigDefault = Config{
 	MaxAge:           0,
 }
 
+// normalizeOrigin validates an HTTP(S) origin and removes a trailing slash.
+func normalizeOrigin(origin string) (bool, string) {
+	parsed, err := url.Parse(origin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" || (parsed.Path != "" && parsed.Path != "/") ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false, ""
+	}
+	return true, strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+}
+
+// validateDomain retains scheme, port and subdomain boundaries when matching.
+func validateDomain(domain, pattern string) bool {
+	if domain == pattern {
+		return true
+	}
+	valid, normalizedDomain := normalizeOrigin(domain)
+	if !valid || normalizedDomain != domain {
+		return false
+	}
+	schemeEnd := strings.Index(pattern, "://")
+	if schemeEnd == -1 {
+		return false
+	}
+	host := pattern[schemeEnd+3:]
+	return strings.HasPrefix(host, "*.") && strings.Count(host, "*") == 1 &&
+		matchSubdomain(domain, pattern)
+}
+
 // New creates a new middleware handler
 func New(config ...Config) fiber.Handler {
 	// Set default config
@@ -86,6 +118,26 @@ func New(config ...Config) fiber.Handler {
 		if cfg.AllowOrigins == "" {
 			cfg.AllowOrigins = ConfigDefault.AllowOrigins
 		}
+	}
+
+	// Validate CORS credentials configuration
+	if cfg.AllowCredentials && cfg.AllowOrigins == "*" {
+		panic("[CORS] Insecure setup, 'AllowCredentials' is set to true, and 'AllowOrigins' is set to a wildcard.")
+	}
+
+	// Validate and normalize static AllowOrigins.
+	if cfg.AllowOrigins != "" && cfg.AllowOrigins != "*" {
+		validatedOrigins := []string{}
+		for _, origin := range strings.Split(cfg.AllowOrigins, ",") {
+			isValid, normalizedOrigin := normalizeOrigin(strings.TrimSpace(origin))
+			if isValid {
+				validatedOrigins = append(validatedOrigins, normalizedOrigin)
+			} else {
+				log.Printf("[CORS] Invalid origin format in configuration: %s", origin)
+				panic("[CORS] Invalid origin provided in configuration")
+			}
+		}
+		cfg.AllowOrigins = strings.Join(validatedOrigins, ",")
 	}
 
 	// Convert string to slice
@@ -112,15 +164,11 @@ func New(config ...Config) fiber.Handler {
 
 		// Check allowed origins
 		for _, o := range allowOrigins {
-			if o == "*" && cfg.AllowCredentials {
-				allowOrigin = origin
+			if o == "*" {
+				allowOrigin = "*"
 				break
 			}
-			if o == "*" || o == origin {
-				allowOrigin = o
-				break
-			}
-			if matchSubdomain(origin, o) {
+			if validateDomain(origin, o) {
 				allowOrigin = origin
 				break
 			}
@@ -147,9 +195,13 @@ func New(config ...Config) fiber.Handler {
 		c.Set(fiber.HeaderAccessControlAllowOrigin, allowOrigin)
 		c.Set(fiber.HeaderAccessControlAllowMethods, allowMethods)
 
-		// Set Allow-Credentials if set to true
+		// Set Allow-Credentials only for a specific allowed origin.
 		if cfg.AllowCredentials {
-			c.Set(fiber.HeaderAccessControlAllowCredentials, "true")
+			if allowOrigin != "*" && allowOrigin != "" {
+				c.Set(fiber.HeaderAccessControlAllowCredentials, "true")
+			} else if allowOrigin == "*" {
+				log.Printf("[CORS] 'AllowCredentials' is true, but 'AllowOrigins' cannot be set to '*'.")
+			}
 		}
 
 		// Set Allow-Headers if not empty
